@@ -1,50 +1,28 @@
-"""
-extractors/speaker_extractor.py
-Calls the LLM to attribute a dialogue quote to a speaker.
-Injects surrounding context (±500 chars) and the character registry.
-"""
-
 import logging
 from schemas import SpeakerResponse
-from json_utils import extract_json
 from prompts.speaker_prompt import SPEAKER_PROMPT
 from config import SPEAKER_MODEL
 
 logger = logging.getLogger(__name__)
 
-_CONTEXT_WINDOW = 500   # characters of surrounding text
+_CONTEXT_WINDOW = 500
 
 
 class SpeakerExtractor:
     def __init__(self, client) -> None:
         self.client = client
 
-    async def extract(
-        self,
-        quote: str,
-        chunk_text: str,
-        character_names: set[str],
-    ) -> SpeakerResponse:
-        """
-        Args:
-            quote:           The dialogue utterance to attribute.
-            chunk_text:      Full text of the chunk containing the quote.
-            character_names: All known names for this novel (registry).
-        """
+    async def extract(self, quote: str, chunk_text: str, character_names: set) -> SpeakerResponse:
         context = self._extract_context(quote, chunk_text)
         char_list = ", ".join(sorted(character_names)) or "Unknown"
-
         prompt = SPEAKER_PROMPT.format(
-            character_list=char_list,
-            quote=quote,
-            context=context,
+            character_list=char_list, quote=quote, context=context
         )
-        raw = await self.client.generate(SPEAKER_MODEL, prompt)
         try:
-            data = extract_json(raw)
+            data = await self.client.generate_json(SPEAKER_MODEL, prompt)
             return SpeakerResponse(**data)
         except Exception as exc:
-            logger.warning("SpeakerExtractor parse error: %s", exc)
+            logger.warning("SpeakerExtractor failed: %s", exc)
             return SpeakerResponse(speaker="UNKNOWN", confidence=0.0)
 
     @staticmethod

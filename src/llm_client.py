@@ -2,11 +2,12 @@
 llm_client.py
 Async HTTP client for a remote Ollama server.
 
-Features:
-- Async context manager (use with `async with OllamaClient() as client`)
-- Enforces JSON-only responses via Ollama's `format: "json"` option
-- Exponential back-off on transient errors
-- Global semaphore limits concurrent in-flight requests
+Two-layer retry strategy:
+  Layer 1 — network retries: exponential back-off on connection errors (MAX_RETRIES).
+  Layer 2 — JSON repair retries: if the response arrives but is not valid JSON,
+            send a lightweight "please fix this JSON" prompt before giving up
+            (JSON_REPAIR_RETRIES).  This catches small models that add preamble
+            text, forget a closing bracket, or wrap the output in markdown.
 """
 
 import asyncio
@@ -18,16 +19,25 @@ from config import (
     REQUEST_TIMEOUT,
     MAX_RETRIES,
     MAX_CONCURRENT_REQUESTS,
+    JSON_REPAIR_RETRIES,
 )
+from json_utils import extract_json
 
 logger = logging.getLogger(__name__)
 
-# One semaphore shared across the entire process.
 _SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+
+_REPAIR_PROMPT = """\
+The following text should be valid JSON but is malformed or incomplete.
+Return ONLY the corrected, complete JSON. No explanation. No markdown. No extra text.
+
+MALFORMED:
+{bad_json}
+"""
 
 
 class OllamaClient:
-    """Async client for Ollama /api/generate endpoint."""
+    """Async client for the Ollama /api/generate endpoint."""
 
     def __init__(self) -> None:
         self._session: aiohttp.ClientSession | None = None
@@ -41,20 +51,54 @@ class OllamaClient:
         if self._session:
             await self._session.close()
 
+    # ─── Public API ──────────────────────────────────────────────────────────
+
     async def generate(self, model: str, prompt: str) -> str:
         """
-        Send a prompt to Ollama and return the raw response string.
-
-        Args:
-            model:  Ollama model name, e.g. "qwen3:32b"
-            prompt: Full prompt text.
-
-        Returns:
-            Raw response string from the model (may need JSON extraction).
-
-        Raises:
-            RuntimeError: after MAX_RETRIES failed attempts.
+        Send a prompt and return the raw response string.
+        Raises RuntimeError after all retries are exhausted.
         """
+        return await self._call(model, prompt)
+
+    async def generate_json(self, model: str, prompt: str) -> dict:
+        """
+        Send a prompt, parse the response as JSON, and return the dict.
+        On parse failure, attempts up to JSON_REPAIR_RETRIES repair calls
+        before raising ValueError.
+        """
+        raw = await self._call(model, prompt)
+
+        # Try to parse immediately
+        try:
+            return extract_json(raw)
+        except ValueError:
+            pass
+
+        # JSON repair loop
+        bad = raw
+        for attempt in range(JSON_REPAIR_RETRIES):
+            logger.warning(
+                "Bad JSON from %s (repair attempt %d/%d). "
+                "First 120 chars: %r",
+                model, attempt + 1, JSON_REPAIR_RETRIES, bad[:120],
+            )
+            repair_prompt = _REPAIR_PROMPT.format(bad_json=bad[:3000])
+            bad = await self._call(model, repair_prompt)
+            try:
+                return extract_json(bad)
+            except ValueError:
+                continue
+
+        raise ValueError(
+            f"Model {model} returned invalid JSON after "
+            f"{JSON_REPAIR_RETRIES} repair attempts. "
+            f"Response: {bad[:200]!r}"
+        )
+
+    # ─── Internal ────────────────────────────────────────────────────────────
+
+    async def _call(self, model: str, prompt: str) -> str:
+        """Raw HTTP call with network-level retry."""
         if self._session is None:
             raise RuntimeError(
                 "OllamaClient must be used as an async context manager."
@@ -66,8 +110,8 @@ class OllamaClient:
             "stream": False,
             "format": "json",
             "options": {
-                "temperature": 0.1,   # low temp → more consistent JSON
-                "num_predict": 8192,  # max tokens in response; prevents truncation
+                "temperature": 0.1,
+                "num_predict": 8192,
             },
         }
 
@@ -86,10 +130,7 @@ class OllamaClient:
                     wait = 2 ** attempt
                     logger.warning(
                         "Ollama attempt %d/%d failed (%s). Retrying in %ds.",
-                        attempt + 1,
-                        MAX_RETRIES,
-                        exc,
-                        wait,
+                        attempt + 1, MAX_RETRIES, exc, wait,
                     )
                     if attempt == MAX_RETRIES - 1:
                         raise RuntimeError(
@@ -97,5 +138,4 @@ class OllamaClient:
                         ) from exc
                     await asyncio.sleep(wait)
 
-        # unreachable, but satisfies type checkers
         raise RuntimeError("Unexpected exit from retry loop")

@@ -1,11 +1,5 @@
-"""
-extractors/listener_extractor.py
-Calls the LLM to identify the intended listener of a dialogue quote.
-"""
-
 import logging
 from schemas import ListenerResponse
-from json_utils import extract_json
 from prompts.listener_prompt import LISTENER_PROMPT
 from config import LISTENER_MODEL
 
@@ -18,28 +12,17 @@ class ListenerExtractor:
     def __init__(self, client) -> None:
         self.client = client
 
-    async def extract(
-        self,
-        quote: str,
-        speaker: str,
-        chunk_text: str,
-        character_names: set[str],
-    ) -> ListenerResponse:
+    async def extract(self, quote: str, speaker: str, chunk_text: str, character_names: set) -> ListenerResponse:
         context = self._extract_context(quote, chunk_text)
         char_list = ", ".join(sorted(character_names)) or "Unknown"
-
         prompt = LISTENER_PROMPT.format(
-            character_list=char_list,
-            speaker=speaker,
-            quote=quote,
-            context=context,
+            character_list=char_list, speaker=speaker, quote=quote, context=context
         )
-        raw = await self.client.generate(LISTENER_MODEL, prompt)
         try:
-            data = extract_json(raw)
+            data = await self.client.generate_json(LISTENER_MODEL, prompt)
             return ListenerResponse(**data)
         except Exception as exc:
-            logger.warning("ListenerExtractor parse error: %s", exc)
+            logger.warning("ListenerExtractor failed: %s", exc)
             return ListenerResponse(listener="UNKNOWN", confidence=0.0)
 
     @staticmethod

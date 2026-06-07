@@ -1,11 +1,5 @@
-"""
-extractors/sentiment_extractor.py
-Calls the LLM to rate the emotional sentiment of a dialogue interaction.
-"""
-
 import logging
 from schemas import SentimentResponse
-from json_utils import extract_json
 from prompts.sentiment_prompt import SENTIMENT_PROMPT
 from config import SENTIMENT_MODEL
 
@@ -18,27 +12,16 @@ class SentimentExtractor:
     def __init__(self, client) -> None:
         self.client = client
 
-    async def extract(
-        self,
-        quote: str,
-        speaker: str,
-        listener: str,
-        chunk_text: str,
-    ) -> SentimentResponse:
+    async def extract(self, quote: str, speaker: str, listener: str, chunk_text: str) -> SentimentResponse:
         context = self._extract_context(quote, chunk_text)
-
         prompt = SENTIMENT_PROMPT.format(
-            speaker=speaker,
-            listener=listener,
-            quote=quote,
-            context=context,
+            speaker=speaker, listener=listener, quote=quote, context=context
         )
-        raw = await self.client.generate(SENTIMENT_MODEL, prompt)
         try:
-            data = extract_json(raw)
+            data = await self.client.generate_json(SENTIMENT_MODEL, prompt)
             return SentimentResponse(**data)
         except Exception as exc:
-            logger.warning("SentimentExtractor parse error: %s", exc)
+            logger.warning("SentimentExtractor failed: %s", exc)
             return SentimentResponse(score=0, emotion="neutral")
 
     @staticmethod
