@@ -97,14 +97,17 @@ SENTIMENT_MODEL        = _profile["sentiment_model"]
 MAX_CHARS_PER_CHUNK    = _profile["max_chars_per_chunk"]
 OVERLAP_CHARS          = _profile["overlap_chars"]
 
-# ─── Concurrency ─────────────────────────────────────────────────────────────
-# Lower if Ollama returns 503 or VRAM errors.
-MAX_CONCURRENT_REQUESTS = 4
 
 # ─── HTTP / Retry ─────────────────────────────────────────────────────────────
-REQUEST_TIMEOUT  = 300   # seconds per LLM call
-MAX_RETRIES      = 3     # network-level retries (exponential back-off)
-JSON_REPAIR_RETRIES = 2  # extra attempts with simplified repair prompt on bad JSON
+REQUEST_TIMEOUT     = 600   # seconds per LLM call — raise if you see timeouts
+MAX_RETRIES         = 2     # network-level retries (fewer = fail faster, move on)
+JSON_REPAIR_RETRIES = 1     # JSON repair attempts (1 is usually enough)
+
+# ─── Concurrency tuning ───────────────────────────────────────────────────────
+# Start at 2 if timeouts are frequent. Raise to 4-6 once stable.
+# The adaptive throttle in _queue.py will also slow down automatically
+# if failure rate exceeds 40% — so erring high is safe.
+MAX_CONCURRENT_REQUESTS = 2
 
 # ─── Scene Segmentation ───────────────────────────────────────────────────────
 PARAGRAPHS_PER_SCENE       = 30
