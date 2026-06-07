@@ -187,13 +187,15 @@ class OllamaClient:
 
                 except Exception as exc:
                     wait = 2 ** attempt
+                    # Include the exception TYPE so blank-message errors are visible
+                    exc_desc = "%s: %s" % (type(exc).__name__, exc) if str(exc) else type(exc).__name__
                     logger.warning(
                         "Ollama attempt %d/%d failed (%s). Retrying in %ds.",
-                        attempt + 1, MAX_RETRIES, exc, wait,
+                        attempt + 1, MAX_RETRIES, exc_desc, wait,
                     )
                     if attempt == MAX_RETRIES - 1:
                         raise RuntimeError(
-                            "Ollama call failed after %d attempts: %s" % (MAX_RETRIES, exc)
+                            "Ollama call failed after %d attempts: %s" % (MAX_RETRIES, exc_desc)
                         ) from exc
                     await asyncio.sleep(wait)
 

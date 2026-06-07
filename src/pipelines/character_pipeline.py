@@ -1,6 +1,8 @@
 """
 pipelines/character_pipeline.py
-Runs character extraction over all chunks concurrently (bounded by semaphore).
+Runs character extraction with a bounded worker queue.
+MAX_CONCURRENT_REQUESTS workers run in parallel; all other chunks wait.
+This prevents blasting Ollama with 380 simultaneous requests.
 """
 
 import asyncio
@@ -8,6 +10,7 @@ import logging
 from extractors.character_extractor import CharacterExtractor
 from character_registry import CharacterRegistry
 from config import MAX_CONCURRENT_REQUESTS
+from pipelines._queue import _run_queue
 
 logger = logging.getLogger(__name__)
 
@@ -18,20 +21,10 @@ class CharacterPipeline:
 
     async def run(self, chunks: list[dict]) -> CharacterRegistry:
         registry = CharacterRegistry()
-        sem = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
-
-        async def process_chunk(chunk):
-            async with sem:
-                return await self.extractor.extract(chunk["text"])
-
-        results = await asyncio.gather(
-            *[process_chunk(c) for c in chunks],
-            return_exceptions=True,
-        )
+        results = await _run_queue(self.extractor.extract, chunks, MAX_CONCURRENT_REQUESTS)
 
         for result in results:
-            if isinstance(result, Exception):
-                logger.warning("CharacterPipeline chunk error: %s", result)
+            if result is None:
                 continue
             for character in result.characters:
                 registry.add_character(character.name, character.aliases)
