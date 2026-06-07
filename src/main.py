@@ -245,6 +245,10 @@ async def main(reset_ids: set[str], reset_stage: str) -> None:
     logger.info("Corpus: %d novels discovered.", len(novels))
 
     async with OllamaClient() as client:
+        # ── Startup: verify Ollama is reachable and models exist ─────────────
+        if not await client.check_models():
+            return   # errors already logged inside check_models()
+
         for novel in novels:
             try:
                 await process_novel(novel, db, client)

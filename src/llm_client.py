@@ -95,6 +95,56 @@ class OllamaClient:
             f"Response: {bad[:200]!r}"
         )
 
+    # ─── Model validation ────────────────────────────────────────────────────
+
+    async def check_models(self) -> bool:
+        """
+        Ping Ollama, list available models, and warn about any models in config
+        that are not found.  Returns False if Ollama is unreachable.
+        """
+        from config import (
+            CHARACTER_MODEL, DIALOGUE_MODEL, SPEAKER_MODEL,
+            LISTENER_MODEL, SENTIMENT_MODEL, ACTIVE_PROFILE,
+        )
+        required = {
+            CHARACTER_MODEL, DIALOGUE_MODEL,
+            SPEAKER_MODEL, LISTENER_MODEL, SENTIMENT_MODEL,
+        }
+
+        try:
+            async with self._session.get(f"{OLLAMA_URL}/api/tags") as resp:
+                resp.raise_for_status()
+                data = await resp.json()
+        except Exception as exc:
+            logger.error(
+                "Cannot reach Ollama at %s — %s\n"
+                "Check that Ollama is running and OLLAMA_URL is correct.",
+                OLLAMA_URL, exc,
+            )
+            return False
+
+        available = {m["name"] for m in data.get("models", [])}
+        logger.info(
+            "Ollama reachable. Profile: '%s'. Available models: %s",
+            ACTIVE_PROFILE,
+            ", ".join(sorted(available)) or "(none)",
+        )
+
+        missing = required - available
+        if missing:
+            logger.error(
+                "The following models are configured but NOT found on Ollama:\n"
+                "  Missing : %s\n"
+                "  Available: %s\n"
+                "Update ACTIVE_PROFILE in config.py or pull the model with `ollama pull <name>`.",
+                ", ".join(sorted(missing)),
+                ", ".join(sorted(available)),
+            )
+            return False
+
+        logger.info("All required models confirmed: %s", ", ".join(sorted(required)))
+        return True
+
     # ─── Internal ────────────────────────────────────────────────────────────
 
     async def _call(self, model: str, prompt: str) -> str:
@@ -124,7 +174,13 @@ class OllamaClient:
                     ) as resp:
                         resp.raise_for_status()
                         result = await resp.json()
-                        return result["response"]
+                        response_text = result.get("response", "")
+                        if not response_text.strip():
+                            raise RuntimeError(
+                                f"Model '{model}' returned an empty response. "
+                                f"Check the model name with `ollama list` on your server."
+                            )
+                        return response_text
 
                 except Exception as exc:
                     wait = 2 ** attempt
