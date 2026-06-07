@@ -3,11 +3,16 @@ llm_client.py
 Async HTTP client for a remote Ollama server.
 
 Two-layer retry strategy:
-  Layer 1 — network retries: exponential back-off on connection errors (MAX_RETRIES).
-  Layer 2 — JSON repair retries: if the response arrives but is not valid JSON,
-            send a lightweight "please fix this JSON" prompt before giving up
-            (JSON_REPAIR_RETRIES).  This catches small models that add preamble
-            text, forget a closing bracket, or wrap the output in markdown.
+  Layer 1 — network retries: exponential back-off on connection/HTTP errors.
+  Layer 2 — JSON repair: if response arrives but isn't valid JSON, re-prompt
+            with a repair request before giving up.
+
+Key design decisions:
+  - NO "format":"json" — causes empty responses on qwen3.5 and some other models.
+    We use prompt instructions + extract_json() instead.
+  - Repair prompt uses % substitution, NOT .format(), to avoid { } collisions
+    with JSON content in the bad response.
+  - Empty response is treated as a retryable error, not a fatal one.
 """
 
 import asyncio
@@ -27,18 +32,14 @@ logger = logging.getLogger(__name__)
 
 _SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
 
-_REPAIR_PROMPT = """\
-The text below should be a valid JSON object but is malformed, incomplete, or wrapped in extra text.
-
-Your task: output ONLY the corrected JSON object.
-- No explanation
-- No markdown fences (no ```json)
-- No preamble or postamble
-- Start your response with { and end with }
-
-MALFORMED INPUT:
-{bad_json}
-"""
+# NOTE: uses %s substitution, NOT .format(), so JSON braces in bad_json
+# don't get misinterpreted as format placeholders.
+_REPAIR_TEMPLATE = (
+    "The text below should be a valid JSON object but is malformed or has extra text.\n"
+    "Output ONLY the corrected JSON object. No explanation. No markdown. No extra text.\n\n"
+    "MALFORMED INPUT:\n"
+    "%s"
+)
 
 
 class OllamaClient:
@@ -59,21 +60,17 @@ class OllamaClient:
     # ─── Public API ──────────────────────────────────────────────────────────
 
     async def generate(self, model: str, prompt: str) -> str:
-        """
-        Send a prompt and return the raw response string.
-        Raises RuntimeError after all retries are exhausted.
-        """
+        """Send a prompt and return the raw response string."""
         return await self._call(model, prompt)
 
     async def generate_json(self, model: str, prompt: str) -> dict:
         """
-        Send a prompt, parse the response as JSON, and return the dict.
-        On parse failure, attempts up to JSON_REPAIR_RETRIES repair calls
-        before raising ValueError.
+        Send a prompt, return parsed JSON dict.
+        On parse failure, retries with a repair prompt up to JSON_REPAIR_RETRIES times.
+        Raises ValueError if all attempts fail.
         """
         raw = await self._call(model, prompt)
 
-        # Try to parse immediately
         try:
             return extract_json(raw)
         except ValueError:
@@ -83,11 +80,10 @@ class OllamaClient:
         bad = raw
         for attempt in range(JSON_REPAIR_RETRIES):
             logger.warning(
-                "Bad JSON from %s (repair attempt %d/%d). "
-                "First 120 chars: %r",
+                "Bad JSON from %s (repair attempt %d/%d). First 120 chars: %r",
                 model, attempt + 1, JSON_REPAIR_RETRIES, bad[:120],
             )
-            repair_prompt = _REPAIR_PROMPT.format(bad_json=bad[:3000])
+            repair_prompt = _REPAIR_TEMPLATE % bad[:3000]
             bad = await self._call(model, repair_prompt)
             try:
                 return extract_json(bad)
@@ -95,17 +91,16 @@ class OllamaClient:
                 continue
 
         raise ValueError(
-            f"Model {model} returned invalid JSON after "
-            f"{JSON_REPAIR_RETRIES} repair attempts. "
-            f"Response: {bad[:200]!r}"
+            "Model %s returned invalid JSON after %d repair attempts. "
+            "Response: %r" % (model, JSON_REPAIR_RETRIES, bad[:200])
         )
 
-    # ─── Model validation ────────────────────────────────────────────────────
+    # ─── Model Validation ────────────────────────────────────────────────────
 
     async def check_models(self) -> bool:
         """
-        Ping Ollama, list available models, and warn about any models in config
-        that are not found.  Returns False if Ollama is unreachable.
+        Ping Ollama and verify all configured models exist.
+        Returns False (and logs errors) if anything is wrong.
         """
         from config import (
             CHARACTER_MODEL, DIALOGUE_MODEL, SPEAKER_MODEL,
@@ -123,7 +118,7 @@ class OllamaClient:
         except Exception as exc:
             logger.error(
                 "Cannot reach Ollama at %s — %s\n"
-                "Check that Ollama is running and OLLAMA_URL is correct.",
+                "Check OLLAMA_URL in config.py.",
                 OLLAMA_URL, exc,
             )
             return False
@@ -138,10 +133,10 @@ class OllamaClient:
         missing = required - available
         if missing:
             logger.error(
-                "The following models are configured but NOT found on Ollama:\n"
-                "  Missing : %s\n"
+                "Models configured but NOT found on Ollama:\n"
+                "  Missing:   %s\n"
                 "  Available: %s\n"
-                "Update ACTIVE_PROFILE in config.py or pull the model with `ollama pull <name>`.",
+                "Fix ACTIVE_PROFILE in config.py or run `ollama pull <name>`.",
                 ", ".join(sorted(missing)),
                 ", ".join(sorted(available)),
             )
@@ -153,19 +148,20 @@ class OllamaClient:
     # ─── Internal ────────────────────────────────────────────────────────────
 
     async def _call(self, model: str, prompt: str) -> str:
-        """Raw HTTP call with network-level retry."""
+        """
+        Raw HTTP call with network-level retry.
+        Empty responses are retried, not silently accepted.
+        """
         if self._session is None:
             raise RuntimeError(
                 "OllamaClient must be used as an async context manager."
             )
 
-        # NOTE: "format": "json" is intentionally omitted.
-        # Some models (e.g. qwen3.5) return empty responses when forced into
-        # JSON mode. We rely on prompt instructions + extract_json() instead.
         payload = {
             "model": model,
             "prompt": prompt,
             "stream": False,
+            # No "format":"json" — causes empty output on qwen3.5 and similar models.
             "options": {
                 "temperature": 0.1,
                 "num_predict": 8192,
@@ -181,13 +177,13 @@ class OllamaClient:
                     ) as resp:
                         resp.raise_for_status()
                         result = await resp.json()
-                        response_text = result.get("response", "")
-                        if not response_text.strip():
+                        text = result.get("response", "").strip()
+                        if not text:
                             raise RuntimeError(
-                                f"Model '{model}' returned an empty response. "
-                                f"Check the model name with `ollama list` on your server."
+                                "Empty response from model '%s'. "
+                                "The model may be overloaded or the prompt too long." % model
                             )
-                        return response_text
+                        return text
 
                 except Exception as exc:
                     wait = 2 ** attempt
@@ -197,7 +193,7 @@ class OllamaClient:
                     )
                     if attempt == MAX_RETRIES - 1:
                         raise RuntimeError(
-                            f"Ollama call failed after {MAX_RETRIES} attempts: {exc}"
+                            "Ollama call failed after %d attempts: %s" % (MAX_RETRIES, exc)
                         ) from exc
                     await asyncio.sleep(wait)
 

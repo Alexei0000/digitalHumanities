@@ -1,12 +1,13 @@
 """
 pipelines/dialogue_pipeline.py
-Runs dialogue extraction over all chunks of one novel.
-Returns a list of dialogue dicts enriched with chunk metadata.
+Runs dialogue extraction over all chunks concurrently (bounded by semaphore).
 """
 
+import asyncio
 import logging
 import uuid
 from extractors.dialogue_extractor import DialogueExtractor
+from config import MAX_CONCURRENT_REQUESTS
 
 logger = logging.getLogger(__name__)
 
@@ -16,38 +17,41 @@ class DialoguePipeline:
         self.extractor = DialogueExtractor(client)
 
     async def run(self, chunks: list[dict]) -> list[dict]:
-        """
-        Returns:
-            List of dicts:
-                {dialogue_id, novel_id, chunk_id, scene_id,
-                 quote, quote_type}
-        """
-        all_dialogues = []
+        sem = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
 
-        for chunk in chunks:
-            result = await self.extractor.extract(chunk["text"])
-
-            for dialogue in result.dialogues:
-                all_dialogues.append(
+        async def process_chunk(chunk):
+            async with sem:
+                result = await self.extractor.extract(chunk["text"])
+                return [
                     {
                         "dialogue_id": str(uuid.uuid4()),
-                        "novel_id": chunk["novel_id"],
-                        "chunk_id": chunk["chunk_id"],
-                        "scene_id": chunk["scene_id"],
-                        "quote": dialogue.quote,
-                        "quote_type": dialogue.quote_type,
-                        "chunk_text": chunk["text"],   # kept for attribution context
+                        "novel_id":    chunk["novel_id"],
+                        "chunk_id":    chunk["chunk_id"],
+                        "scene_id":    chunk["scene_id"],
+                        "quote":       d.quote,
+                        "quote_type":  d.quote_type,
+                        "chunk_text":  chunk["text"],
                     }
-                )
+                    for d in result.dialogues
+                ]
+
+        results = await asyncio.gather(
+            *[process_chunk(c) for c in chunks],
+            return_exceptions=True,
+        )
+
+        all_dialogues = []
+        for result in results:
+            if isinstance(result, Exception):
+                logger.warning("DialoguePipeline chunk error: %s", result)
+                continue
+            all_dialogues.extend(result)
 
         if all_dialogues:
-            logger.info(
-                "DialoguePipeline: %d dialogues extracted.", len(all_dialogues)
-            )
+            logger.info("DialoguePipeline: %d dialogues extracted.", len(all_dialogues))
         else:
             logger.warning(
                 "DialoguePipeline: 0 dialogues extracted from %d chunks. "
-                "Check quote style in this novel.",
-                len(chunks),
+                "Check quote style in this novel.", len(chunks),
             )
         return all_dialogues
