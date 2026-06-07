@@ -28,10 +28,15 @@ logger = logging.getLogger(__name__)
 _SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
 
 _REPAIR_PROMPT = """\
-The following text should be valid JSON but is malformed or incomplete.
-Return ONLY the corrected, complete JSON. No explanation. No markdown. No extra text.
+The text below should be a valid JSON object but is malformed, incomplete, or wrapped in extra text.
 
-MALFORMED:
+Your task: output ONLY the corrected JSON object.
+- No explanation
+- No markdown fences (no ```json)
+- No preamble or postamble
+- Start your response with { and end with }
+
+MALFORMED INPUT:
 {bad_json}
 """
 
@@ -154,11 +159,13 @@ class OllamaClient:
                 "OllamaClient must be used as an async context manager."
             )
 
+        # NOTE: "format": "json" is intentionally omitted.
+        # Some models (e.g. qwen3.5) return empty responses when forced into
+        # JSON mode. We rely on prompt instructions + extract_json() instead.
         payload = {
             "model": model,
             "prompt": prompt,
             "stream": False,
-            "format": "json",
             "options": {
                 "temperature": 0.1,
                 "num_predict": 8192,
